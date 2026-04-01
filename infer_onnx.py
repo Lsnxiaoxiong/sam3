@@ -14,7 +14,6 @@ from loguru import logger
 from numpy.typing import NDArray
 from osam._models.yoloworld.clip import tokenize
 
-from merge_data import load_onnx_with_data_from_bytes, get_session
 
 
 def parse_args() -> argparse.Namespace:
