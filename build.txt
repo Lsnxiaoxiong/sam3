@@ -1,0 +1,3 @@
+nuitka --standalone   --nofollow-import-to=test      test.py
+
+pyinstaller -D -n sam3 --collect-all torch --hidden-import torch test.py

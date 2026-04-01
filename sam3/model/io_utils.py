@@ -132,13 +132,6 @@ def load_video_frames(
         match = re.match(r"<load-dummy-video-(\d+)>", video_path)
         num_frames = int(match.group(1)) if match else 60
         return load_dummy_video(image_size, offload_video_to_cpu, num_frames=num_frames)
-    elif video_path.startswith("<load-zero-video"):
-        # Check for pattern <load-zero-video-N> where N is an integer
-        match = re.match(r"<load-zero-video-(\d+)>", video_path)
-        num_frames = int(match.group(1)) if match else 60
-        return load_dummy_video(
-            image_size, offload_video_to_cpu, num_frames=num_frames, do_zeros=True
-        )
     elif os.path.isdir(video_path):
         return load_video_frames_from_image_folder(
             image_folder=video_path,
@@ -329,15 +322,12 @@ def load_video_frames_from_video_file_using_cv2(
     return video_tensor, original_height, original_width
 
 
-def load_dummy_video(image_size, offload_video_to_cpu, num_frames=60, do_zeros=False):
+def load_dummy_video(image_size, offload_video_to_cpu, num_frames=60):
     """
     Load a dummy video with random frames for testing and compilation warmup purposes.
     """
     video_height, video_width = 480, 640  # dummy original video sizes
-    if not do_zeros:
-        images = torch.randn(num_frames, 3, image_size, image_size, dtype=torch.float16)
-    else:
-        images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float16)
+    images = torch.randn(num_frames, 3, image_size, image_size, dtype=torch.float16)
     if not offload_video_to_cpu:
         images = images.cuda()
     return images, video_height, video_width
