@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import pathlib
+from dataclasses import dataclass
 from importlib import resources
 from typing import Sequence
 
@@ -17,10 +19,30 @@ from osam._models.yoloworld.clip import tokenize
 IMAGE_SIZE = 1008
 
 
-def _providers() -> list[str]:
+@dataclass
+class ReferenceState:
+    features: np.ndarray
+    valid_mask: np.ndarray
+    weight: np.ndarray
+    source: str
+
+
+def _providers() -> list[tuple[str, dict[str, str]] | str]:
     available = ort.get_available_providers()
-    ordered = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    return [provider for provider in ordered if provider in available]
+    providers: list[tuple[str, dict[str, str]] | str] = []
+    if "CUDAExecutionProvider" in available:
+        providers.append(
+            (
+                "CUDAExecutionProvider",
+                {
+                    "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": "DEFAULT",
+                },
+            )
+        )
+    if "CPUExecutionProvider" in available:
+        providers.append("CPUExecutionProvider")
+    return providers
 
 
 def _parse_point_list(value: str | None) -> np.ndarray | None:
@@ -95,23 +117,46 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model-dir", type=pathlib.Path, default=pathlib.Path("models"))
-    parser.add_argument("--image", type=pathlib.Path, required=True)
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--image", type=pathlib.Path)
+    input_group.add_argument("--images", type=pathlib.Path, nargs="+")
     parser.add_argument("--output", type=pathlib.Path, default=pathlib.Path("output/onnx_result.jpg"))
+    parser.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path("output/onnx_results"))
     parser.add_argument("--mode", choices=["grounding", "interactive"], required=True)
     parser.add_argument("--text-prompt", type=str)
     parser.add_argument("--grounding-boxes", type=str, help="xyxy pixel boxes, separated by ';'")
     parser.add_argument("--grounding-box-labels", type=str, help="1/0 labels for grounding boxes")
+    parser.add_argument("--reference-image", type=pathlib.Path, help="Reference image for cross-image feature transfer")
+    parser.add_argument("--reference-boxes", type=str, help="Reference xyxy pixel boxes on the reference image, separated by ';'")
+    parser.add_argument("--reference-weight", type=float, default=1.0, help="Weight applied to transferred reference features")
     parser.add_argument("--point-coords", type=str, help="x,y;x,y in pixels")
     parser.add_argument("--point-labels", type=str, help="1,0,...")
     parser.add_argument("--box-prompt", type=str, help="xyxy pixel boxes, separated by ';'")
     parser.add_argument("--mask-input", type=pathlib.Path, help="Path to .npy low-res mask logits")
     parser.add_argument("--multimask-output", action="store_true")
     parser.add_argument("--score-threshold", type=float, default=0.5)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.image is not None:
+        args.images = [args.image]
+    if args.mode == "interactive" and len(args.images) > 1:
+        raise ValueError("interactive mode currently supports a single target image only")
+    return args
 
 
 def _session(model_dir: pathlib.Path, name: str) -> ort.InferenceSession:
-    return ort.InferenceSession(str(model_dir / name), providers=_providers())
+    session_options = ort.SessionOptions()
+    session_options.enable_mem_pattern = False
+    session_options.enable_cpu_mem_arena = False
+    return ort.InferenceSession(
+        str(model_dir / name),
+        sess_options=session_options,
+        providers=_providers(),
+    )
+
+
+def _load_rgb_image(path: pathlib.Path) -> PIL.Image.Image:
+    with PIL.Image.open(path) as image:
+        return image.convert("RGB")
 
 
 def _run_image_encoder(session: ort.InferenceSession, image: PIL.Image.Image) -> dict[str, np.ndarray]:
@@ -127,11 +172,48 @@ def _run_text_encoder(session: ort.InferenceSession, prompt: str) -> dict[str, n
     return dict(zip(names, outputs))
 
 
-def _grounding_inference(args: argparse.Namespace, image: PIL.Image.Image) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
-    image_session = _session(args.model_dir, "sam3_image_encoder.onnx")
-    text_session = _session(args.model_dir, "sam3_text_encoder.onnx")
-    grounding_session = _session(args.model_dir, "sam3_grounding_decoder.onnx")
+def _reference_encoder_session(model_dir: pathlib.Path) -> ort.InferenceSession:
+    return _session(model_dir, "sam3_reference_feature_encoder.onnx")
 
+
+def _extract_reference_state(
+    image_session: ort.InferenceSession,
+    reference_session: ort.InferenceSession,
+    image: PIL.Image.Image,
+    boxes_xyxy: np.ndarray,
+    weight: float,
+    source: str,
+) -> ReferenceState | None:
+    if boxes_xyxy is None or len(boxes_xyxy) == 0:
+        return None
+    image_out = _run_image_encoder(image_session, image)
+    scaled_boxes = _scaled_xyxy_to_model_space(boxes_xyxy, image.width, image.height)
+    reference_embedding = reference_session.run(
+        None,
+        {
+            "backbone_fpn_0": image_out["backbone_fpn_0"],
+            "reference_boxes_xyxy": scaled_boxes,
+        },
+    )[0].astype(np.float32)
+    state = ReferenceState(
+        features=reference_embedding[:, None, :],
+        valid_mask=np.ones((reference_embedding.shape[0], 1), dtype=bool),
+        weight=np.asarray([weight], dtype=np.float32),
+        source=source,
+    )
+    del image_out, scaled_boxes, reference_embedding
+    gc.collect()
+    return state
+
+
+def _grounding_inference(
+    args: argparse.Namespace,
+    image: PIL.Image.Image,
+    image_session: ort.InferenceSession,
+    text_session: ort.InferenceSession,
+    grounding_session: ort.InferenceSession,
+    reference_state: ReferenceState | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     image_out = _run_image_encoder(image_session, image)
     prompt = args.text_prompt or "visual"
     text_out = _run_text_encoder(text_session, prompt)
@@ -168,6 +250,11 @@ def _grounding_inference(args: argparse.Namespace, image: PIL.Image.Image) -> tu
         "box_valid_mask": box_valid_mask,
         "box_labels": box_labels,
     }
+    if reference_state is not None:
+        feeds["reference_features"] = reference_state.features
+        feeds["reference_valid_mask"] = reference_state.valid_mask
+        feeds["reference_weight"] = reference_state.weight
+
     session_input_names = {item.name for item in grounding_session.get_inputs()}
     feeds = {name: value for name, value in feeds.items() if name in session_input_names}
     outputs = grounding_session.run(None, feeds)
@@ -182,6 +269,8 @@ def _grounding_inference(args: argparse.Namespace, image: PIL.Image.Image) -> tu
             f"no detections passed score threshold {args.score_threshold:.3f}; "
             f"max score was {max_score:.3f}"
         )
+        del image_out, text_out, feeds, outputs, out, scores, keep
+        gc.collect()
         return (
             np.zeros((0, 4), dtype=np.float32),
             np.zeros((0,), dtype=np.float32),
@@ -193,7 +282,10 @@ def _grounding_inference(args: argparse.Namespace, image: PIL.Image.Image) -> tu
     boxes_xyxy[:, [1, 3]] *= image.height
     masks_logits = _upsample_masks(out["masks_logits"][0][keep], image.width, image.height)
     masks = masks_logits > 0
-    return boxes_xyxy, scores[keep], masks, prompt
+    scores_kept = scores[keep]
+    del image_out, text_out, feeds, outputs, out, scores, keep, masks_logits
+    gc.collect()
+    return boxes_xyxy, scores_kept, masks, prompt
 
 
 def _interactive_inference(args: argparse.Namespace, image: PIL.Image.Image) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
@@ -261,6 +353,113 @@ def _interactive_inference(args: argparse.Namespace, image: PIL.Image.Image) -> 
     return dummy_boxes, scores, masks, "interactive"
 
 
+def _run_grounding_sequence(args: argparse.Namespace) -> None:
+    image_session = _session(args.model_dir, "sam3_image_encoder.onnx")
+    text_session = _session(args.model_dir, "sam3_text_encoder.onnx")
+    grounding_session = _session(args.model_dir, "sam3_grounding_decoder.onnx")
+    reference_model_path = args.model_dir / "sam3_reference_feature_encoder.onnx"
+    with_reference_model_path = args.model_dir / "sam3_grounding_decoder_with_reference.onnx"
+    grounding_with_reference_session = None
+    if with_reference_model_path.exists():
+        grounding_with_reference_session = _session(
+            args.model_dir, "sam3_grounding_decoder_with_reference.onnx"
+        )
+    reference_session = None
+    if reference_model_path.exists():
+        reference_session = _reference_encoder_session(args.model_dir)
+
+    reference_boxes = _parse_box_list(args.reference_boxes)
+    reference_state: ReferenceState | None = None
+    if args.reference_image is not None:
+        if reference_boxes is None:
+            raise ValueError("--reference-image requires --reference-boxes")
+        if reference_session is None:
+            raise FileNotFoundError(
+                f"missing {reference_model_path}; re-export models with reference_feature_encoder support"
+            )
+        reference_image = _load_rgb_image(args.reference_image)
+        reference_state = _extract_reference_state(
+            image_session=image_session,
+            reference_session=reference_session,
+            image=reference_image,
+            boxes_xyxy=reference_boxes,
+            weight=args.reference_weight,
+            source=f"manual:{args.reference_image.name}",
+        )
+        print(f"loaded reference features from {args.reference_image}")
+        del reference_image
+        gc.collect()
+
+    multi_image = len(args.images) > 1
+    for index, image_path in enumerate(args.images):
+        image = _load_rgb_image(image_path)
+        boxes_xyxy = None
+        scores = None
+        masks = None
+        try:
+            active_reference = reference_state if index > 0 or args.reference_image is not None else None
+            session_to_use = grounding_session
+            if active_reference is not None:
+                if grounding_with_reference_session is None:
+                    raise FileNotFoundError(
+                        f"missing {with_reference_model_path}; re-export models with grounding_decoder_with_reference support"
+                    )
+                session_to_use = grounding_with_reference_session
+            boxes_xyxy, scores, masks, caption_prefix = _grounding_inference(
+                args=args,
+                image=image,
+                image_session=image_session,
+                text_session=text_session,
+                grounding_session=session_to_use,
+                reference_state=active_reference,
+            )
+
+            output_path = (
+                args.output
+                if not multi_image
+                else args.output_dir / f"{image_path.stem}_onnx_result{args.output.suffix or '.jpg'}"
+            )
+            _visualize(image, masks, boxes_xyxy, scores, caption_prefix, output_path)
+            print(f"saved {output_path}")
+
+            if multi_image and index == 0 and reference_state is None and reference_session is not None:
+                if reference_boxes is not None:
+                    reference_state = _extract_reference_state(
+                        image_session=image_session,
+                        reference_session=reference_session,
+                        image=image,
+                        boxes_xyxy=reference_boxes,
+                        weight=args.reference_weight,
+                        source=f"first-image-boxes:{image_path.name}",
+                    )
+                    if reference_state is not None:
+                        print(f"extracted cross-image reference from provided boxes on {image_path.name}")
+                elif len(boxes_xyxy) > 0:
+                    best_index = int(np.argmax(scores))
+                    reference_state = _extract_reference_state(
+                        image_session=image_session,
+                        reference_session=reference_session,
+                        image=image,
+                        boxes_xyxy=boxes_xyxy[best_index : best_index + 1],
+                        weight=args.reference_weight,
+                        source=f"first-image:{image_path.name}",
+                    )
+                    if reference_state is not None:
+                        print(
+                            "extracted cross-image reference from "
+                            f"{image_path.name} score={float(scores[best_index]):.3f}"
+                        )
+
+            if multi_image and active_reference is not None:
+                print(f"used reference features from {active_reference.source} for {image_path.name}")
+        finally:
+            del image, boxes_xyxy, scores, masks
+            gc.collect()
+
+    del image_session, text_session, grounding_session, grounding_with_reference_session, reference_session
+    gc.collect()
+
+
 def _visualize(
     image: PIL.Image.Image,
     masks: np.ndarray,
@@ -284,13 +483,12 @@ def _visualize(
 
 def main() -> None:
     args = parse_args()
-    image = PIL.Image.open(args.image).convert("RGB")
-
     if args.mode == "grounding":
-        boxes_xyxy, scores, masks, caption_prefix = _grounding_inference(args, image)
-    else:
-        boxes_xyxy, scores, masks, caption_prefix = _interactive_inference(args, image)
+        _run_grounding_sequence(args)
+        return
 
+    image = PIL.Image.open(args.images[0]).convert("RGB")
+    boxes_xyxy, scores, masks, caption_prefix = _interactive_inference(args, image)
     _visualize(image, masks, boxes_xyxy, scores, caption_prefix, args.output)
     print(f"saved {args.output}")
 
@@ -299,6 +497,16 @@ if __name__ == "__main__":
     main()
 
 """
-python infer_onnx.py --model-dir output --output output/onnx_result3_thr045.jpg --image assets/images/groceries.jpg --mode grounding --text-prompt "red light" --score-threshold 0.45
-
+ - 单图普通推理
+    conda run -n sam3 python infer_onnx.py --model-dir output --image assets/images/groceries.jpg --mode grounding --text-prompt "red light" --output output/onnx_result.jpg        
+  - 多图跨图特征传递，首图自动取最高分目标做 reference                                                                                                                              
+    conda run -n sam3 python infer_onnx.py --model-dir output --images assets/videos/0001/9.jpg assets/videos/0001/14.jpg assets/videos/0001/20.jpg assets/videos/0001/49.jpg assets/videos/0001/59.jpg assets/videos/0001/69.jpg assets/videos/0001/79.jpg assets/videos/0001/89.jpg --mode grounding --text-prompt "white T-shirt" --output-dir output/onnx_seq                 
+  - 多图跨图特征传递，首图用你指定的框做 reference                                                                                                                                  
+    python infer_onnx.py --model-dir output --images assets/videos/0001/9.jpg assets/videos/0001/14.jpg assets/videos/0001/20.jpg assets/videos/0001/49.jpg assets/videos/0001/59.jpg assets/videos/0001/69.jpg assets/videos/0001/79.jpg assets/videos/0001/89.jpg --mode grounding --text-prompt "white T-shirt" --reference-boxes "600,355,866,510" --output-dir output/onnx_seq                                                                                                                                                             
+  - 用独立参考图给当前图传 reference 特征                                                                                                                                           
+    conda run -n sam3 python infer_onnx.py --model-dir output --image query.jpg --mode grounding --text-prompt "person" --reference-image ref.jpg --reference-boxes "90,60,260,380" 
+    --output output/query_with_ref.jpg                                                                                                                                              
+  - 单图交互式点/框提示                                                                                                                                                             
+    conda run -n sam3 python infer_onnx.py --model-dir output --image assets/images/groceries.jpg --mode interactive --point-coords "320,240" --point-labels "1" --box-prompt       
+    "200,120,520,460" --output output/interactive_result.jpg   
 """
