@@ -592,3 +592,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+"""
+python export_onnx.py --checkpoint C:\Users\lsn\.cache\modelscope\hub\models\facebook\sam3\sam3.pt --output-dir output --device cpu
+
+"""

@@ -80,6 +80,8 @@ def _xyxy_pixels_to_cxcywh_normalized(boxes_xyxy: np.ndarray, width: int, height
 
 
 def _upsample_masks(masks: np.ndarray, width: int, height: int) -> np.ndarray:
+    if len(masks) == 0:
+        return np.zeros((0, height, width), dtype=np.float32)
     resized = []
     for mask in masks:
         pil = PIL.Image.fromarray(mask.astype(np.float32), mode="F")
@@ -174,6 +176,18 @@ def _grounding_inference(args: argparse.Namespace, image: PIL.Image.Image) -> tu
 
     scores = out["scores"][0]
     keep = scores >= args.score_threshold
+    if not np.any(keep):
+        max_score = float(np.max(scores)) if scores.size else float("nan")
+        print(
+            f"no detections passed score threshold {args.score_threshold:.3f}; "
+            f"max score was {max_score:.3f}"
+        )
+        return (
+            np.zeros((0, 4), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0, image.height, image.width), dtype=bool),
+            prompt,
+        )
     boxes_xyxy = out["boxes_xyxy"][0][keep]
     boxes_xyxy[:, [0, 2]] *= image.width
     boxes_xyxy[:, [1, 3]] *= image.height
@@ -283,3 +297,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+"""
+python infer_onnx.py --model-dir output --output output/onnx_result3_thr045.jpg --image assets/images/groceries.jpg --mode grounding --text-prompt "red light" --score-threshold 0.45
+
+"""
