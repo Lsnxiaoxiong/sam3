@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 import pathlib
 from dataclasses import dataclass
 from importlib import resources
@@ -30,14 +31,23 @@ class ReferenceState:
 def _providers() -> list[tuple[str, dict[str, str]] | str]:
     available = ort.get_available_providers()
     providers: list[tuple[str, dict[str, str]] | str] = []
-    if "CUDAExecutionProvider" in available:
+    requested_provider = os.getenv("SAM3_ORT_PROVIDER", "cuda").lower()
+    if requested_provider != "cpu" and "CUDAExecutionProvider" in available:
+        cuda_options: dict[str, str] = {
+            "arena_extend_strategy": "kSameAsRequested",
+            "cudnn_conv_algo_search": os.getenv(
+                "SAM3_ORT_CUDNN_CONV_ALGO_SEARCH", "HEURISTIC"
+            ),
+        }
+        if os.getenv("SAM3_ORT_CUDNN_MAX_WORKSPACE", "0") == "0":
+            cuda_options["cudnn_conv_use_max_workspace"] = "0"
+        gpu_mem_limit_mb = os.getenv("SAM3_ORT_GPU_MEM_LIMIT_MB")
+        if gpu_mem_limit_mb:
+            cuda_options["gpu_mem_limit"] = str(int(gpu_mem_limit_mb) * 1024 * 1024)
         providers.append(
             (
                 "CUDAExecutionProvider",
-                {
-                    "arena_extend_strategy": "kSameAsRequested",
-                    "cudnn_conv_algo_search": "DEFAULT",
-                },
+                cuda_options,
             )
         )
     if "CPUExecutionProvider" in available:
