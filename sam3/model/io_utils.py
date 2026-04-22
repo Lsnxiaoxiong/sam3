@@ -152,7 +152,23 @@ def load_video_frames(
             video_loader_type=video_loader_type,
         )
     else:
-        raise NotImplementedError("Only video files and image folders are supported")
+        # No recognized extension (e.g., extensionless OIL paths) — attempt video loading.
+        # Only raise if the loader itself fails to decode frames.
+        try:
+            return load_video_frames_from_video_file(
+                video_path=video_path,
+                image_size=image_size,
+                offload_video_to_cpu=offload_video_to_cpu,
+                img_mean=img_mean,
+                img_std=img_std,
+                async_loading_frames=async_loading_frames,
+                video_loader_type=video_loader_type,
+            )
+        except Exception as e:
+            raise NotImplementedError(
+                f"Only video files and image folders are supported; "
+                f"failed to load '{video_path}' as video: {e}"
+            ) from e
 
 
 def load_video_frames_from_image_folder(
