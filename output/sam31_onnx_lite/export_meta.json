@@ -1,0 +1,12 @@
+{
+  "checkpoint": "C:\\Users\\lsn\\.cache\\modelscope\\hub\\models\\facebook\\sam3___1\\sam3.1_multiplex.pt",
+  "exports": {
+    "sam31_image_encoder": "output\\sam31_onnx_lite\\sam31_image_encoder\\sam31_image_encoder.onnx",
+    "sam31_text_encoder": "output\\sam31_onnx_lite\\sam31_text_encoder\\sam31_text_encoder.onnx",
+    "sam31_grounding_decoder": "output\\sam31_onnx_lite\\sam31_grounding_decoder\\sam31_grounding_decoder.onnx",
+    "sam31_point_decoder": "output\\sam31_onnx_lite\\sam31_point_decoder\\sam31_point_decoder.onnx",
+    "sam31_box_decoder": "output\\sam31_onnx_lite\\sam31_box_decoder\\sam31_box_decoder.onnx",
+    "sam31_video_prompt_decoder": "output\\sam31_onnx_lite\\sam31_video_prompt_decoder\\sam31_video_prompt_decoder.onnx"
+  },
+  "device": "cpu"
+}
