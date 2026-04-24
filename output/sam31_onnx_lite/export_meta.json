@@ -1,12 +1,15 @@
-{
-  "checkpoint": "C:\\Users\\lsn\\.cache\\modelscope\\hub\\models\\facebook\\sam3___1\\sam3.1_multiplex.pt",
-  "exports": {
-    "sam31_image_encoder": "output\\sam31_onnx_lite\\sam31_image_encoder\\sam31_image_encoder.onnx",
-    "sam31_text_encoder": "output\\sam31_onnx_lite\\sam31_text_encoder\\sam31_text_encoder.onnx",
-    "sam31_grounding_decoder": "output\\sam31_onnx_lite\\sam31_grounding_decoder\\sam31_grounding_decoder.onnx",
-    "sam31_point_decoder": "output\\sam31_onnx_lite\\sam31_point_decoder\\sam31_point_decoder.onnx",
-    "sam31_box_decoder": "output\\sam31_onnx_lite\\sam31_box_decoder\\sam31_box_decoder.onnx",
-    "sam31_video_prompt_decoder": "output\\sam31_onnx_lite\\sam31_video_prompt_decoder\\sam31_video_prompt_decoder.onnx"
-  },
-  "device": "cpu"
+﻿{
+    "checkpoint":  "C:\\Users\\lsn\\.cache\\modelscope\\hub\\models\\facebook\\sam3___1\\sam3.1_multiplex.pt",
+    "exports":  {
+                    "sam31_image_encoder":  "output\\sam31_onnx_lite\\sam31_image_encoder\\sam31_image_encoder.onnx",
+                    "sam31_text_encoder":  "output\\sam31_onnx_lite\\sam31_text_encoder\\sam31_text_encoder.onnx",
+                    "sam31_grounding_decoder":  "output\\sam31_onnx_lite\\sam31_grounding_decoder\\sam31_grounding_decoder.onnx",
+                    "sam31_reference_feature_encoder":  "output\\sam31_onnx_lite\\sam31_reference_feature_encoder\\sam31_reference_feature_encoder.onnx",
+                    "sam31_grounding_decoder_with_reference":  "output\\sam31_onnx_lite\\sam31_grounding_decoder_with_reference\\sam31_grounding_decoder_with_reference.onnx",
+                    "sam31_interactive_decoder":  "output\\sam31_onnx_lite\\sam31_interactive_decoder\\sam31_interactive_decoder.onnx",
+                    "sam31_video_prompt_decoder":  "output\\sam31_onnx_lite\\sam31_video_prompt_decoder\\sam31_video_prompt_decoder.onnx",
+                    "sam31_point_decoder":  "output\\sam31_onnx_lite\\sam31_point_decoder\\sam31_point_decoder.onnx",
+                    "sam31_box_decoder":  "output\\sam31_onnx_lite\\sam31_box_decoder\\sam31_box_decoder.onnx"
+                },
+    "device":  "cpu"
 }
