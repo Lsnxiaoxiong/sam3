@@ -4,6 +4,13 @@
 
 读者不需要先懂深度学习。可以把模型理解成一条流水线：图片、文字、点、框先被转换成数字矩阵；模型用这些矩阵计算出“每个像素属于目标的概率”；最后把概率图变成黑白掩码。
 
+本文当前已经能说明完整主线，但如果你要自己改模型、换 checkpoint 或排查 ONNX 输出异常，只看“导出命令”还不够。最关键的是理解四件事：
+
+1. `.pt` 只提供权重，模型结构来自源码。
+2. ONNX 导出的是一次可执行的 Tensor 计算路径，不是 Python 推理脚本。
+3. 拆分点必须来自官方推理数据流，而不是凭感觉切文件。
+4. 导出成功不等于推理正确，必须检查每个 ONNX 的输入输出和最终 mask。
+
 ## 1. `.pt` 文件到底是什么
 
 `.pt` 不是 ONNX，也不一定是一个能直接调用的完整模型对象。它通常只是 PyTorch 保存的权重文件。权重可以理解成模型里每一层的参数表，例如卷积层、注意力层、文本编码层的矩阵。
@@ -776,6 +783,380 @@ sam31_video_prompt_decoder 直接视频路径
 
 它们是探索真正跨帧状态传递的实验路径，但目前掩码质量不稳定。
 
-## 18. 一句话总结
+## 18. 导出脚本逐步拆解
+
+前面的章节解释了为什么要这样拆。本节按 `sam31_onnx_lite/export_sam31_lite.py` 的真实执行顺序说明“具体怎么做”。
+
+### 18.1 先 patch，再建模
+
+导出脚本开头会调用：
+
+```python
+_patch_vitdet_rope_for_export()
+_patch_mask_downsampler_for_export()
+_patch_decoder_for_export()
+```
+
+这些 patch 的目的不是改模型能力，而是把某些 PyTorch 写法改成 ONNX 更容易导出的写法。
+
+`_patch_vitdet_rope_for_export()` 处理视觉 backbone 里的 RoPE 位置编码。原实现可能使用复数或不易导出的旋转编码路径，patch 后把实部、虚部分开保存成普通 Tensor：
+
+```text
+freqs_cis -> freqs_cis_real + freqs_cis_imag
+```
+
+ONNX 对普通 float Tensor 支持更稳定。
+
+`_patch_tracker_rope_for_export()` 对 tracker 里的 RoPEAttention 做类似处理，并关闭部分高性能但不适合导出的 fused attention 路径：
+
+```text
+use_rope_real = True
+use_fa3 = False
+```
+
+`_patch_mask_downsampler_for_export()` 把 mask 下采样里的插值逻辑改成固定、显式的 `F.interpolate(..., antialias=False)`。这样 ONNX tracing 时不会遇到不稳定的动态分支。
+
+`_patch_decoder_for_export()` 改写 transformer decoder 的相对位置偏置矩阵计算，避免缓存和 Python 侧状态影响导出。
+
+判断是否需要 patch 的方法是：先尝试导出最小模块；如果报错集中在某个算子、复数 Tensor、缓存、Python 分支或自定义路径，就把这部分改写成等价的 Tensor 运算。
+
+### 18.2 重建 image model
+
+SAM3.1 图像模型用：
+
+```python
+image_model = build_sam3_image_model(
+    checkpoint_path=args.checkpoint,
+    load_from_HF=False,
+    bpe_path=None,
+    device=args.device,
+    eval_mode=True,
+    enable_inst_interactivity=True,
+).float().eval()
+```
+
+这里有三个重点。
+
+`load_from_HF=False` 表示不要联网下载，直接使用本地 checkpoint。
+
+`eval_mode=True` 和 `.eval()` 表示进入推理模式。推理模式会关闭 dropout 等训练专用行为，输出更稳定。
+
+`enable_inst_interactivity=True` 表示图像模型里要创建交互式 predictor。没有它，点/框提示路径所需的 `sam2_backbone_out` 和交互 decoder 不会存在。
+
+### 18.3 加载 SAM3.1 交互式权重
+
+普通 checkpoint 加载只处理 detector 主体。SAM3.1 的交互式权重还需要额外映射：
+
+```python
+_load_interactive_predictor_weights(image_model, args.checkpoint)
+```
+
+这一步解决的是“checkpoint key 名”和“模型对象成员名”不一致的问题。
+
+例如 checkpoint 里是：
+
+```text
+tracker.model.interactive_sam_mask_decoder.*
+```
+
+image model 里期望的是：
+
+```text
+inst_interactive_predictor.model.sam_mask_decoder.*
+```
+
+所以脚本按前缀替换 key，并且只加载 shape 完全一致的权重。这样做可以避免把相似名字但形状不同的参数错误加载进去。
+
+### 18.4 重建 tracker
+
+视频 prompt decoder 使用 tracker：
+
+```python
+tracker = build_tracker(apply_temporal_disambiguation=True).to(device).float().eval()
+_load_tracker_checkpoint(tracker, args.checkpoint)
+_patch_tracker_rope_for_export(tracker)
+```
+
+SAM3.1 checkpoint 的 tracker key 是 `tracker.model.*`，但 `build_tracker()` 创建出来的模块内部不带这个前缀。因此 `_load_tracker_checkpoint()` 会做：
+
+```text
+tracker.model.xxx -> xxx
+```
+
+同样只加载名称存在且 shape 一致的 tensor。
+
+### 18.5 创建 wrapper
+
+导出脚本不会直接导出 `image_model` 或 `tracker`，而是创建 wrapper：
+
+```python
+image_encoder = ImageEncoderWrapper(image_model)
+text_encoder = TextEncoderWrapper(image_model)
+grounding_decoder = GroundingDecoderWrapper(image_model)
+interactive_decoder = InteractiveDecoderWrapper(image_model)
+video_decoder = VideoPromptDecoderWrapper(tracker)
+```
+
+wrapper 的作用是把复杂对象接口改成普通 Tensor 接口。ONNX Runtime 只认识 Tensor 输入输出，不认识 `state`、`Prompt`、`FindStage` 这类 Python 对象。
+
+### 18.6 构造 sample input
+
+ONNX tracing 必须给每个模块一组样例输入。样例输入不是最终推理数据，而是用来让 PyTorch 跑一遍前向计算并记录计算图。
+
+导出脚本里的样例输入包括：
+
+```python
+sample_image = _preprocess_image(args.sample_image, device)
+sample_tokens = tokenizer(["truck"], context_length=TEXT_CONTEXT)
+sample_points = torch.tensor([[[320.0, 420.0]]])
+sample_point_labels = torch.tensor([[1]])
+sample_box = torch.tensor([[220.0, 180.0, 860.0, 820.0]])
+sample_box_valid = torch.tensor([[True]])
+sample_mask = torch.zeros((1, 1, 288, 288))
+```
+
+为什么要先跑 image encoder 和 text encoder？
+
+因为后续 decoder 的输入不是原图和原始文字，而是 image encoder / text encoder 的中间特征：
+
+```python
+with torch.no_grad():
+    image_feats = image_encoder(sample_image)
+    language_feats = text_encoder(sample_tokens)
+```
+
+这一步也能提前验证 wrapper 是否能在 PyTorch 下正常执行。如果 PyTorch wrapper 都跑不通，ONNX 导出一定不会可靠。
+
+### 18.7 `ExportSpec` 是模块导出的说明书
+
+导出脚本用 `ExportSpec` 描述每个 ONNX：
+
+```python
+class ExportSpec:
+    name: str
+    model: nn.Module
+    inputs: Tuple[torch.Tensor, ...]
+    input_names: Sequence[str]
+    output_names: Sequence[str]
+    dynamic_axes: Optional[Dict[str, Dict[int, str]]] = None
+```
+
+字段含义：
+
+| 字段 | 含义 |
+| --- | --- |
+| `name` | 输出目录名和 ONNX 文件名 |
+| `model` | 要导出的 wrapper |
+| `inputs` | tracing 用的样例 Tensor |
+| `input_names` | ONNX 对外暴露的输入名 |
+| `output_names` | ONNX 对外暴露的输出名 |
+| `dynamic_axes` | 哪些维度允许运行时变化 |
+
+例如 image encoder 的 spec 是：
+
+```text
+name: sam31_image_encoder
+input_names: image
+output_names: vision_pos_enc_0/1/2, backbone_fpn_0/1/2, sam2_...
+```
+
+这就是为什么推理脚本里可以用：
+
+```python
+image_out["backbone_fpn_0"]
+image_out["sam2_backbone_fpn_2"]
+```
+
+如果 `output_names` 写错，ONNX 能导出，但推理脚本会取不到对应 key。
+
+### 18.8 `torch.onnx.export()` 参数为什么这样选
+
+实际导出函数：
+
+```python
+torch.onnx.export(
+    spec.model,
+    spec.inputs,
+    str(path),
+    input_names=list(spec.input_names),
+    output_names=list(spec.output_names),
+    dynamic_axes=spec.dynamic_axes,
+    opset_version=17,
+    do_constant_folding=False,
+    external_data=True,
+)
+```
+
+`opset_version=17` 表示使用 ONNX 算子集 17。算子集可以理解成 ONNX 支持的算子版本。版本太低可能缺少模型需要的算子。
+
+`external_data=True` 表示大权重可以拆到外部数据文件。SAM3/SAM3.1 很大，单个 ONNX 如果超过 protobuf 限制会保存失败，所以大模型导出通常要打开 external data。
+
+`do_constant_folding=False` 表示不让导出器过度折叠常量。大型 transformer 模型里，常量折叠可能让导出更慢或引入不必要的大常量。这里优先保证导出稳定。
+
+`dynamic_axes=None` 表示当前 Lite 导出基本固定 batch 和分辨率。这样部署更简单，但灵活性较低。如果要支持动态 batch 或动态 prompt 数量，需要为对应输入输出补充 dynamic axes，并重新验证 ONNX Runtime 是否支持。
+
+### 18.9 为什么点/框 decoder 是 alias
+
+导出后脚本会把 `sam31_interactive_decoder.onnx` 复制成：
+
+```text
+sam31_point_decoder.onnx
+sam31_box_decoder.onnx
+```
+
+原因是点提示和框提示底层使用同一个 interactive decoder，只是输入不同：
+
+```text
+点模式：point_coords 有效，box_valid_mask=False
+框模式：point_labels=-1，box_valid_mask=True
+```
+
+复制成两个文件的好处是推理接口更清晰，用户可以按任务选择 `point_decoder` 或 `box_decoder`，但维护上只需要一个 decoder 实现。
+
+### 18.10 为什么还要保存 `sam31_interactive_dense_pe.npy`
+
+interactive decoder 需要 prompt encoder 的 dense positional encoding：
+
+```python
+sample_interactive_pe = image_model.inst_interactive_predictor.model.sam_prompt_encoder.get_dense_pe()
+np.save(output_dir / "sam31_interactive_dense_pe.npy", ...)
+```
+
+它不是用户输入，也不是图片特征，而是模型固定位置编码。为了避免每次推理重新构造 PyTorch 模型，导出时把它保存成 `.npy`，ONNX 推理时直接读取并作为 `image_pe` 输入。
+
+### 18.11 `export_meta.json` 的作用
+
+导出结束会生成：
+
+```text
+output/sam31_onnx_lite/export_meta.json
+```
+
+里面记录：
+
+```json
+{
+  "checkpoint": "...sam3.1_multiplex.pt",
+  "exports": {
+    "sam31_image_encoder": "...onnx",
+    "sam31_text_encoder": "...onnx"
+  },
+  "device": "cpu"
+}
+```
+
+它的作用是追踪这批 ONNX 来自哪个 checkpoint、输出到哪里、用哪个 device 导出。后续排查“ONNX 和 checkpoint 是否对应”时先看这个文件。
+
+## 19. 导出后如何检查 ONNX 接口
+
+导出后不要立刻写业务代码。先检查每个 ONNX 的输入输出是否符合预期。
+
+可以用 ONNX Runtime：
+
+```python
+import onnxruntime as ort
+
+sess = ort.InferenceSession("output/sam31_onnx_lite/sam31_image_encoder/sam31_image_encoder.onnx")
+
+print("inputs")
+for x in sess.get_inputs():
+    print(x.name, x.shape, x.type)
+
+print("outputs")
+for y in sess.get_outputs():
+    print(y.name, y.shape, y.type)
+```
+
+重点看三件事：
+
+1. 输入名是否和推理脚本喂入的 key 一致。
+2. shape rank 是否一致，例如 `[1, 1, 4]` 和 `[1, 4]` 不能混用。
+3. dtype 是否一致，例如 token id 要是 int64，图片要是 float32。
+
+本仓库推理脚本的 `_run_with_available_inputs()` 会过滤掉 ONNX 不需要的输入：
+
+```python
+input_names = {i.name for i in sess.get_inputs()}
+filtered = {k: v for k, v in feeds.items() if k in input_names}
+outputs = sess.run(None, filtered)
+```
+
+这样做的好处是同一套 feed 字典可以复用于不同 alias 模型。坏处是如果你拼错了某个输入名，它可能被静默过滤。因此调试新模块时，建议临时打印 `filtered.keys()`，确认关键输入没有被漏掉。
+
+## 20. 如何做 PyTorch 与 ONNX 对齐验证
+
+真正严谨的导出流程应该包含两层验证。
+
+第一层是模块数值对齐。对同一组输入，同时跑 PyTorch wrapper 和 ONNX：
+
+```python
+with torch.no_grad():
+    torch_out = wrapper(*torch_inputs)
+
+onnx_out = sess.run(None, numpy_inputs)
+```
+
+然后比较：
+
+```python
+import numpy as np
+
+np.max(np.abs(torch_tensor.cpu().numpy() - onnx_array))
+np.mean(np.abs(torch_tensor.cpu().numpy() - onnx_array))
+```
+
+大模型里不一定要求完全相等，但差异不能大到改变 mask 形状。
+
+第二层是任务级验证。也就是用真实图片和真实 prompt 看最终 mask：
+
+```text
+文本：是否找到文字描述的目标
+点：提示点是否落在 mask 内
+框：mask 是否与框覆盖的目标一致
+视频：相邻帧是否稳定
+```
+
+为什么任务级验证比数值验证更重要？因为有时单个模块数值差异很小，但后处理选 mask 的逻辑不同，最终图片会明显错。
+
+本项目最终采用的判断方式是：
+
+```text
+mask area 不能太小或太大
+bbox 不能全图
+point_hit 必须为 True
+视频 bbox 和面积要连续
+```
+
+## 21. 如果要重新划分模块，应该怎么判断边界
+
+重新划分模块时，不要从文件名判断，要从数据流判断。
+
+一个模块边界是否合理，可以问五个问题：
+
+1. 这个边界两侧是否都是 Tensor？
+2. 这个输出是否会被多个后续任务复用？
+3. 这个模块是否能用固定样例输入独立跑通？
+4. 这个模块是否避免了 Python 状态对象？
+5. 这个模块的输出是否方便用 ONNX Runtime 检查？
+
+以 SAM3.1 为例，`image_encoder` 是好边界，因为：
+
+```text
+输入：图片 Tensor
+输出：视觉特征 Tensor
+复用：文本、点、框、视频都要用
+```
+
+`Sam3Processor.set_text_prompt()` 不是好边界，因为：
+
+```text
+输入：Python state + 字符串
+输出：Python dict
+内部：会修改 state
+```
+
+这类接口适合 PyTorch 业务调用，不适合直接 ONNX 化。
+
+## 22. 一句话总结
 
 `.pt` 是权重，不是部署模型。要把 SAM3/SAM3.1 转成 ONNX，必须先从官方示例找到真实推理路径，再从 `model_builder.py` 恢复 PyTorch 模型，从 processor 和核心类中找出图像、文本、交互、视频各自的数据流，沿着稳定 Tensor 边界拆成多个 wrapper，最后分别导出并用真实图片/视频验证掩码质量。
