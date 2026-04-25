@@ -152,3 +152,6 @@ Thumbs.db
 *.bpe
 *.vocab
 *.onnx
+
+output/
+
